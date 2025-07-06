@@ -1,0 +1,563 @@
+# Convex Agent
+
+The Convex Agent Component is an AI framework built specifically for Convex that automatically handles chat history storage, provides a testing playground, includes smart context retrieval, and integrates seamlessly with other Convex components. Think of it as your complete toolkit for building AI-powered applications.
+
+## Getting Started
+
+### **Prerequisites**
+
+Before you can use the Agent Component, you need a Convex project. Convex is a backend platform that handles your database, serverless functions, and much more[1][2]. If you don't have one yet, create it by running:
+
+```bash
+npm create convex
+```
+
+### **Installation**
+
+Install the agent component in your project:
+
+```bash
+npm install @convex-dev/agent
+```
+
+Next, configure your Convex app to use the agent component by creating or updating your `convex.config.ts` file:
+
+```typescript
+// convex/convex.config.ts
+import { defineApp } from "convex/server";
+import agent from "@convex-dev/agent/convex.config";
+
+const app = defineApp();
+app.use(agent);
+
+export default app;
+```
+
+## Creating Your First Agent
+
+### **Basic Agent Setup**
+
+Creating an agent is similar to using the AI SDK, but with built-in Convex integration:
+
+```typescript
+import { Agent } from "@convex-dev/agent";
+import { components } from "./_generated/api";
+import { openai } from "@ai-sdk/openai";
+
+const supportAgent = new Agent(components.agent, {
+  chat: openai.chat("gpt-4o-mini"),
+  textEmbedding: openai.embedding("text-embedding-3-small"),
+  instructions: "You are a helpful assistant.",
+});
+```
+
+### **Agent Configuration Options**
+
+You can customize your agent with various options:
+
+```typescript
+const supportAgent = new Agent(components.agent, {
+  // Required: The chat model for generating responses
+  chat: openai.chat("gpt-4o-mini"),
+  
+  // Default instructions for the agent
+  instructions: "You are a helpful assistant.",
+  
+  // Tools the agent can use (we'll cover this later)
+  tools: { accountLookup, fileTicket, sendEmail },
+  
+  // Embedding model for smart context retrieval
+  textEmbedding: openai.embedding("text-embedding-3-small"),
+  
+  // Maximum steps for tool calls (default: 1)
+  maxSteps: 10,
+  
+  // Maximum retries for failed tool calls (default: 3)
+  maxRetries: 3,
+  
+  // Track token usage (optional)
+  usageHandler: async (ctx, { model, usage }) => {
+    // Log or save usage data
+  },
+});
+```
+
+## Working with Conversations
+
+### **Starting New Conversations**
+
+Create a new conversation thread for a user:
+
+```typescript
+export const createThread = mutation({
+  args: {},
+  handler: async (ctx): Promise => {
+    const userId = await getUserId(ctx);
+    const { threadId } = await supportAgent.createThread(ctx, { userId });
+    return { threadId };
+  },
+});
+```
+
+### **Continuing Conversations**
+
+Pick up where you left off in an existing conversation:
+
+```typescript
+export const continueThread = action({
+  args: { prompt: v.string(), threadId: v.string() },
+  handler: async (ctx, { prompt, threadId }): Promise => {
+    const { thread } = await supportAgent.continueThread(ctx, { threadId });
+    const result = await thread.generateText({ prompt });
+    return result.text;
+  },
+});
+```
+
+### **Complete Example: Creating and Using a Thread**
+
+Here's how to create a thread and immediately start a conversation:
+
+```typescript
+export const createThreadAndPrompt = action({
+  args: { prompt: v.string() },
+  handler: async (ctx, { prompt }) => {
+    const userId = await getUserId(ctx);
+    // Start a new thread for the user
+    const { threadId, thread } = await supportAgent.createThread(ctx, { userId });
+    // Generate a response to the prompt
+    const result = await thread.generateText({ prompt });
+    return { threadId, text: result.text };
+  },
+});
+```
+
+## Generating Different Types of Content
+
+### **Text Generation**
+
+The most common use case is generating text responses:
+
+```typescript
+const result = await thread.generateText({ prompt: "Tell me a story" });
+console.log(result.text); // The generated story
+```
+
+### **Structured Object Generation**
+
+You can also generate structured data using schemas:
+
+```typescript
+import { z } from "zod";
+
+const result = await thread.generateObject({
+  prompt: "Analyze this customer request",
+  schema: z.object({
+    analysis: z.string().describe("A detailed analysis"),
+    priority: z.enum(["low", "medium", "high"]),
+    suggestedAction: z.string().describe("What to do next"),
+  }),
+});
+
+console.log(result.object.priority); // "high"
+```
+
+## Building Interactive Features
+
+### **Displaying Messages**
+
+To show conversation history in your app, create a query function:
+
+```typescript
+export const listThreadMessages = query({
+  args: {
+    threadId: v.string(),
+    paginationOpts: paginationOptsValidator,
+  },
+  handler: async (ctx, { threadId, paginationOpts }) => {
+    const paginated = await supportAgent.listMessages(ctx, {
+      threadId,
+      paginationOpts,
+    });
+    return paginated;
+  },
+});
+```
+
+Then use it in your React component:
+
+```tsx
+import { useThreadMessages, toUIMessages } from "@convex-dev/agent/react";
+
+function ChatComponent({ threadId }: { threadId: string }) {
+  const messages = useThreadMessages(
+    api.chat.listThreadMessages,
+    { threadId },
+    { initialNumItems: 10 }
+  );
+  
+  return (
+    
+      {toUIMessages(messages.results ?? []).map((message) => (
+        {message.content}
+      ))}
+    
+  );
+}
+```
+
+### **Real-time Streaming**
+
+For a more interactive experience, you can stream responses as they're generated:
+
+```typescript
+export const streamResponse = action({
+  args: { prompt: v.string(), threadId: v.string() },
+  handler: async (ctx, { prompt, threadId }) => {
+    const { thread } = await supportAgent.continueThread(ctx, { threadId });
+    const result = await thread.streamText({ prompt });
+    
+    // Process the stream
+    for await (const chunk of result.textStream) {
+      console.log(chunk); // Each piece of text as it arrives
+    }
+    
+    return result.text; // Final complete text
+  },
+});
+```
+
+## Adding Tools and Capabilities
+
+### **Creating Custom Tools**
+
+Tools let your agent perform actions beyond just generating text. Here's how to create a tool that searches your database:
+
+```typescript
+import { createTool } from "@convex-dev/agent";
+import { z } from "zod";
+
+const searchTool = createTool({
+  description: "Search for information in the knowledge base",
+  args: z.object({
+    query: z.string().describe("What to search for"),
+  }),
+  handler: async (ctx, args): Promise => {
+    const results = await ctx.runQuery(api.knowledge.search, { 
+      query: args.query 
+    });
+    return `Found ${results.length} results: ${results.map(r => r.title).join(", ")}`;
+  },
+});
+```
+
+### **Using Tools in Your Agent**
+
+Add tools when creating your agent:
+
+```typescript
+const supportAgent = new Agent(components.agent, {
+  chat: openai.chat("gpt-4o-mini"),
+  instructions: "You are a helpful assistant with access to our knowledge base.",
+  tools: {
+    searchKnowledge: searchTool,
+    // You can add multiple tools
+  },
+  maxSteps: 5, // Allow multiple tool calls
+});
+```
+
+### **Dynamic Tool Creation**
+
+You can also create tools dynamically based on context:
+
+```typescript
+function createUserSpecificTools(userId: string) {
+  return {
+    getUserInfo: tool({
+      description: "Get information about the current user",
+      parameters: z.object({}),
+      execute: async () => {
+        return await getUserData(userId);
+      },
+    }),
+  };
+}
+
+// Use when continuing a thread
+const { thread } = await supportAgent.continueThread(ctx, { 
+  threadId,
+  tools: createUserSpecificTools(userId)
+});
+```
+
+## Advanced Features
+
+### **Smart Context Retrieval**
+
+The agent automatically finds relevant past messages to include in conversations. You can customize this behavior:
+
+```typescript
+const result = await thread.generateText({ prompt }, {
+  contextOptions: {
+    // Include recent messages
+    recentMessages: 50,
+    // Search for relevant messages
+    searchOptions: {
+      limit: 10,
+      textSearch: true,
+      vectorSearch: true,
+    },
+    // Search other conversations too
+    searchOtherThreads: true,
+  },
+});
+```
+
+### **Managing Thread Information**
+
+Get information about threads:
+
+```typescript
+// List all threads for a user
+const threads = await ctx.runQuery(components.agent.threads.listThreadsByUserId, {
+  userId,
+  order: "desc",
+  paginationOpts: { cursor: null, numItems: 10 }
+});
+
+// Get specific thread details
+const thread = await ctx.runQuery(components.agent.threads.getThread, {
+  threadId,
+});
+
+// Update thread metadata
+await ctx.runMutation(components.agent.threads.updateThread, {
+  threadId,
+  title: "Customer Support Chat",
+  summary: "User asking about billing",
+});
+```
+
+### **Tracking Usage and Costs**
+
+Monitor how much your agent is costing you:
+
+```typescript
+const supportAgent = new Agent(components.agent, {
+  // ... other config
+  usageHandler: async (ctx, args) => {
+    const { userId, model, usage } = args;
+    
+    // Save usage data
+    await ctx.runMutation(api.billing.recordUsage, {
+      userId,
+      model,
+      inputTokens: usage.promptTokens,
+      outputTokens: usage.completionTokens,
+      cost: calculateCost(usage, model),
+    });
+  },
+});
+```
+
+## Testing and Development
+
+### **Using the Playground**
+
+The Agent Component includes a built-in playground for testing your agents. Set it up by creating a playground configuration:
+
+```typescript
+// convex/playground.ts
+import { playgroundTool } from "@convex-dev/agent";
+import { supportAgent } from "./myAgent";
+
+export const playground = playgroundTool(supportAgent);
+```
+
+Then run the playground:
+
+```bash
+npx @convex-dev/agent-playground
+```
+
+This gives you a web interface to test your agent without building a full frontend[1][3].
+
+### **Asynchronous Message Processing**
+
+For better user experience, you can save messages immediately and process them asynchronously:
+
+```typescript
+export const sendMessage = mutation({
+  args: { threadId: v.string(), prompt: v.string() },
+  handler: async (ctx, { threadId, prompt }) => {
+    // Save the user's message immediately
+    const { messageId } = await supportAgent.saveMessage(ctx, {
+      threadId,
+      prompt,
+      skipEmbeddings: true, // Generate these later
+    });
+    
+    // Process the response asynchronously
+    await ctx.scheduler.runAfter(0, internal.chat.processResponse, {
+      threadId,
+      promptMessageId: messageId,
+    });
+    
+    return { messageId };
+  },
+});
+
+export const processResponse = internalAction({
+  args: { threadId: v.string(), promptMessageId: v.string() },
+  handler: async (ctx, { threadId, promptMessageId }) => {
+    const { thread } = await supportAgent.continueThread(ctx, { threadId });
+    await thread.generateText({ promptMessageId });
+  },
+});
+```
+
+## Integration with Workflows
+
+### **Building Durable Workflows**
+
+For complex, multi-step processes, integrate with the Workflow component:
+
+```typescript
+import { WorkflowManager } from "@convex-dev/workflow";
+
+const workflow = new WorkflowManager(components.workflow);
+
+export const customerSupportWorkflow = workflow.define({
+  args: { prompt: v.string(), userId: v.string() },
+  handler: async (step, { prompt, userId }) => {
+    // Step 1: Create thread
+    const { threadId } = await step.runMutation(internal.support.createThread, {
+      userId,
+    });
+    
+    // Step 2: Get initial response
+    const response = await step.runAction(internal.support.generateResponse, {
+      threadId,
+      prompt,
+    });
+    
+    // Step 3: If escalation needed, create ticket
+    if (response.needsEscalation) {
+      await step.runMutation(internal.tickets.createTicket, {
+        userId,
+        issue: response.summary,
+      });
+    }
+    
+    return response;
+  },
+});
+```
+
+### **Exposing Agent Functions for Workflows**
+
+Create reusable agent functions for workflow steps:
+
+```typescript
+// Create a thread as a standalone mutation
+export const createThread = supportAgent.createThreadMutation();
+
+// Generate text as a standalone action
+export const generateSupport = supportAgent.asTextAction({
+  maxSteps: 10,
+});
+
+// Generate structured data as a standalone action
+export const analyzeRequest = supportAgent.asObjectAction({
+  schema: z.object({
+    category: z.string(),
+    priority: z.enum(["low", "medium", "high"]),
+    needsEscalation: z.boolean(),
+  }),
+});
+```
+
+## Best Practices and Tips
+
+### **Performance Optimization**
+
+- **Use appropriate batch sizes** for processing large amounts of data
+- **Enable parallel processing** only when operations are independent
+- **Cache frequently accessed data** to reduce database queries
+
+### **Security Considerations**
+
+- **Always validate user permissions** before accessing threads
+- **Sanitize user inputs** before passing to the agent
+- **Use internal actions** for sensitive operations
+
+### **Cost Management**
+
+- **Monitor token usage** with usage handlers
+- **Set appropriate context limits** to control costs
+- **Use cheaper models** for simple tasks when possible
+
+### **Error Handling**
+
+```typescript
+export const safeGenerateText = action({
+  args: { prompt: v.string(), threadId: v.string() },
+  handler: async (ctx, { prompt, threadId }) => {
+    try {
+      const { thread } = await supportAgent.continueThread(ctx, { threadId });
+      const result = await thread.generateText({ prompt });
+      return { success: true, text: result.text };
+    } catch (error) {
+      console.error("Failed to generate text:", error);
+      return { 
+        success: false, 
+        error: "Sorry, I'm having trouble right now. Please try again." 
+      };
+    }
+  },
+});
+```
+
+## Common Troubleshooting
+
+### **Circular Dependencies**
+
+If you encounter circular dependency errors, add explicit return types to your functions:
+
+```typescript
+export const myAction = action({
+  args: { prompt: v.string() },
+  handler: async (ctx, { prompt }): Promise => {
+    // Explicit return type prevents circular dependencies
+    const result = await supportAgent.generateText(ctx, {}, { prompt });
+    return result.text;
+  },
+});
+```
+
+### **Schema Validation Issues**
+
+Make sure your database schema matches the data you're trying to store. The agent component handles most of this automatically, but custom fields may need schema updates.
+
+### **Performance Issues**
+
+- Reduce context window size if responses are slow
+- Use streaming for long responses
+- Consider using cheaper models for simple tasks
+
+This guide covers the essential concepts for building AI agents with the Convex Agent Component. The framework handles the complex parts like message storage, context retrieval, and real-time updates, letting you focus on building great user experiences. Start with simple text generation and gradually add more advanced features like tools, streaming, and workflows as your application grows.
+
+[1] https://www.convex.dev/components/agent
+[2] https://www.npmjs.com/package/@convex-dev/agent
+[3] https://github.com/get-convex/agent/blob/main/README.md
+[4] https://badge.fury.io/js/@convex-dev%2fagent.svg
+[5] https://badge.fury.io/js/@convex-dev%2fagent
+[6] https://convex.dev/components
+[7] https://github.com/get-convex/agent/tree/main
+[8] https://stack.convex.dev/ai-agents
+[9] https://www.npmjs.com/package/@convex-dev/agent?activeTab=versions
+[10] https://www.convex.dev/components
+[11] https://docs.convex.dev/agents
+[12] https://docs.convex.dev/components
+[13] https://www.npmjs.com/package/@convex-dev/agent-playground

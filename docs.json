@@ -22,14 +22,19 @@
             ]
           },
           {
-            "group": "Essentials",
+            "group": "Convex",
             "pages": [
-              "essentials/markdown",
-              "essentials/code",
-              "essentials/images",
-              "essentials/settings",
-              "essentials/navigation",
-              "essentials/reusable-snippets"
+              "convex/agent",
+              "convex/workflow",
+              "convex/database-migration",
+              "convex/workpool",
+              "convex/guidelines"
+            ]
+          },
+          {
+            "group": "React",
+            "pages": [
+              "react/state-management"
             ]
           }
         ]

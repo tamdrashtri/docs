@@ -1,0 +1,520 @@
+# Convex Workflow Component
+
+This guide will teach you how to build reliable, long-running workflows using the Convex Workflow Component. Think of workflows as a way to chain together multiple functions that need to run in a specific order, with built-in error handling and the ability to survive server crashes.
+
+## What Are Workflows?
+
+Workflows are like a series of tasks that need to be completed in order, but with superpowers:
+
+- **Durable**: They survive server restarts and crashes
+- **Reliable**: Each step can have its own retry logic
+- **Long-running**: Can run for months if needed
+- **Observable**: You can watch their progress in real-time
+- **Cancellable**: Stop them anytime if needed
+
+Think of it like a recipe where each step must be completed before moving to the next, but if something goes wrong (like the oven breaks), the system remembers where you left off and can continue later.
+
+## Getting Started
+
+### **Installation**
+
+First, install the workflow component:
+
+```bash
+npm install @convex-dev/workflow
+```
+
+### **Configuration**
+
+Set up the component in your Convex configuration:
+
+```typescript
+// convex/convex.config.ts
+import { defineApp } from "convex/server";
+import workflow from "@convex-dev/workflow/convex.config";
+
+const app = defineApp();
+app.use(workflow);
+export default app;
+```
+
+### **Creating a Workflow Manager**
+
+Create a workflow manager in your Convex functions:
+
+```typescript
+// convex/workflows.ts
+import { WorkflowManager } from "@convex-dev/workflow";
+import { components } from "./_generated/api";
+
+export const workflow = new WorkflowManager(components.workflow);
+```
+
+## Creating Your First Workflow
+
+### **Basic Workflow Structure**
+
+Here's a simple workflow that processes a file:
+
+```typescript
+export const processFileWorkflow = workflow.define({
+  args: { fileId: v.string() },
+  handler: async (step, args): Promise => {
+    // Step 1: Validate the file
+    const validation = await step.runQuery(
+      internal.files.validateFile,
+      { fileId: args.fileId }
+    );
+    
+    // Step 2: Process the file
+    const result = await step.runAction(
+      internal.files.processFile,
+      { fileId: args.fileId, validation }
+    );
+    
+    // Step 3: Save the results
+    await step.runMutation(
+      internal.files.saveResults,
+      { fileId: args.fileId, result }
+    );
+    
+    return "File processed successfully";
+  },
+});
+```
+
+### **Key Components Explained**
+
+- **`workflow.define()`**: Creates a new workflow definition
+- **`step.runQuery()`**: Runs a Convex query within the workflow
+- **`step.runAction()`**: Runs a Convex action within the workflow
+- **`step.runMutation()`**: Runs a Convex mutation within the workflow
+- **Return type annotation**: Always specify the return type to avoid circular dependencies
+
+## Starting and Managing Workflows
+
+### **Starting a Workflow**
+
+Start a workflow from a mutation or action:
+
+```typescript
+export const startProcessing = mutation({
+  args: { fileId: v.string() },
+  handler: async (ctx, { fileId }) => {
+    const workflowId = await workflow.start(
+      ctx,
+      internal.workflows.processFileWorkflow,
+      { fileId }
+    );
+    return workflowId;
+  },
+});
+```
+
+### **Checking Workflow Status**
+
+Monitor your workflow's progress:
+
+```typescript
+export const getWorkflowStatus = query({
+  args: { workflowId: v.string() },
+  handler: async (ctx, { workflowId }) => {
+    return await workflow.status(ctx, workflowId);
+  },
+});
+```
+
+The status can be:
+- `"inProgress"`: Currently running
+- `"completed"`: Finished successfully
+- `"failed"`: Encountered an error
+- `"canceled"`: Manually stopped
+
+### **Canceling a Workflow**
+
+Stop a running workflow:
+
+```typescript
+export const cancelWorkflow = mutation({
+  args: { workflowId: v.string() },
+  handler: async (ctx, { workflowId }) => {
+    await workflow.cancel(ctx, workflowId);
+  },
+});
+```
+
+## Advanced Workflow Features
+
+### **Running Steps in Parallel**
+
+When steps don't depend on each other, run them simultaneously:
+
+```typescript
+export const parallelWorkflow = workflow.define({
+  args: { userId: v.string() },
+  handler: async (step, args): Promise => {
+    // These run at the same time
+    const [profile, preferences, history] = await Promise.all([
+      step.runQuery(internal.users.getProfile, { userId: args.userId }),
+      step.runQuery(internal.users.getPreferences, { userId: args.userId }),
+      step.runQuery(internal.users.getHistory, { userId: args.userId }),
+    ]);
+    
+    // This runs after all three complete
+    await step.runMutation(internal.users.updateSummary, {
+      userId: args.userId,
+      profile,
+      preferences,
+      history,
+    });
+  },
+});
+```
+
+### **Delayed Execution**
+
+Schedule steps to run at specific times:
+
+```typescript
+export const scheduledWorkflow = workflow.define({
+  args: { userId: v.string() },
+  handler: async (step, args): Promise => {
+    // Send immediate welcome email
+    await step.runAction(internal.emails.sendWelcome, { userId: args.userId });
+    
+    // Send follow-up email in 7 days
+    await step.runAction(
+      internal.emails.sendFollowUp,
+      { userId: args.userId },
+      { runAfter: 7 * 24 * 60 * 60 * 1000 } // 7 days in milliseconds
+    );
+    
+    // Send survey in 30 days
+    await step.runAction(
+      internal.emails.sendSurvey,
+      { userId: args.userId },
+      { runAfter: 30 * 24 * 60 * 60 * 1000 } // 30 days
+    );
+  },
+});
+```
+
+### **Handling Workflow Results**
+
+Process the final result when a workflow completes:
+
+```typescript
+export const startWorkflowWithCallback = mutation({
+  args: { data: v.string() },
+  handler: async (ctx, { data }) => {
+    const workflowId = await workflow.start(
+      ctx,
+      internal.workflows.processDataWorkflow,
+      { data },
+      {
+        onComplete: internal.workflows.handleCompletion,
+        context: { originalData: data }, // Pass extra data
+      }
+    );
+    return workflowId;
+  },
+});
+
+export const handleCompletion = mutation({
+  args: {
+    workflowId: vWorkflowId,
+    result: vResultValidator,
+    context: v.any(),
+  },
+  handler: async (ctx, args) => {
+    if (args.result.kind === "success") {
+      console.log("Workflow succeeded:", args.result.returnValue);
+      // Handle success
+    } else if (args.result.kind === "error") {
+      console.error("Workflow failed:", args.result.error);
+      // Handle error
+    } else if (args.result.kind === "canceled") {
+      console.log("Workflow was canceled");
+      // Handle cancellation
+    }
+  },
+});
+```
+
+## Error Handling and Retries
+
+### **Basic Retry Configuration**
+
+Set up automatic retries for unreliable operations:
+
+```typescript
+const workflow = new WorkflowManager(components.workflow, {
+  defaultRetryBehavior: {
+    maxAttempts: 3,        // Try up to 3 times
+    initialBackoffMs: 100, // Wait 100ms before first retry
+    base: 2,               // Double the wait time each retry
+  },
+});
+```
+
+### **Per-Step Retry Control**
+
+Customize retry behavior for individual steps:
+
+```typescript
+export const robustWorkflow = workflow.define({
+  args: { data: v.string() },
+  handler: async (step, args): Promise => {
+    // This step uses default retry behavior
+    await step.runAction(internal.api.reliableCall, args);
+    
+    // This step has custom retry settings
+    await step.runAction(
+      internal.api.unreliableCall,
+      args,
+      {
+        retry: {
+          maxAttempts: 5,
+          initialBackoffMs: 500,
+          base: 1.5,
+        }
+      }
+    );
+    
+    // This step never retries (for operations that shouldn't be repeated)
+    await step.runAction(
+      internal.payments.chargeCard,
+      args,
+      { retry: false }
+    );
+  },
+});
+```
+
+### **Workflow-Level Retry Settings**
+
+Set retry behavior for an entire workflow:
+
+```typescript
+export const retryWorkflow = workflow.define({
+  args: { data: v.string() },
+  handler: async (step, args): Promise => {
+    // All steps in this workflow will retry by default
+    await step.runAction(internal.api.call1, args);
+    await step.runAction(internal.api.call2, args);
+  },
+  workpoolOptions: {
+    retryActionsByDefault: true,
+    defaultRetryBehavior: {
+      maxAttempts: 2,
+      initialBackoffMs: 200,
+      base: 2,
+    },
+  },
+});
+```
+
+## Performance and Resource Management
+
+### **Controlling Parallel Execution**
+
+Limit how many workflows run simultaneously to manage server load:
+
+```typescript
+const workflow = new WorkflowManager(components.workflow, {
+  workpoolOptions: {
+    maxParallelism: 5, // Only 5 workflows can run at once
+  },
+});
+```
+
+### **Cleaning Up Completed Workflows**
+
+Remove workflow data after completion to save storage:
+
+```typescript
+export const cleanupWorkflow = action({
+  args: { workflowId: v.string() },
+  handler: async (ctx, { workflowId }) => {
+    // Wait for workflow to complete
+    let status;
+    do {
+      status = await workflow.status(ctx, workflowId);
+      if (status.type === "inProgress") {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+    } while (status.type === "inProgress");
+    
+    // Clean up the workflow data
+    await workflow.cleanup(ctx, workflowId);
+  },
+});
+```
+
+## Real-World Examples
+
+### **File Processing Pipeline**
+
+```typescript
+export const fileProcessingWorkflow = workflow.define({
+  args: { fileId: v.string(), userId: v.string() },
+  handler: async (step, args): Promise => {
+    // Step 1: Validate file
+    const validation = await step.runQuery(
+      internal.files.validateFile,
+      { fileId: args.fileId }
+    );
+    
+    if (!validation.isValid) {
+      throw new Error(`Invalid file: ${validation.reason}`);
+    }
+    
+    // Step 2: Process file (might take a while)
+    const processedFile = await step.runAction(
+      internal.files.processFile,
+      { fileId: args.fileId },
+      { retry: { maxAttempts: 3, initialBackoffMs: 1000, base: 2 } }
+    );
+    
+    // Step 3: Generate thumbnail
+    const thumbnail = await step.runAction(
+      internal.files.generateThumbnail,
+      { fileId: processedFile.id }
+    );
+    
+    // Step 4: Update database
+    await step.runMutation(
+      internal.files.updateFileRecord,
+      {
+        fileId: args.fileId,
+        processedUrl: processedFile.url,
+        thumbnailUrl: thumbnail.url,
+        status: "completed",
+      }
+    );
+    
+    // Step 5: Notify user
+    await step.runAction(
+      internal.notifications.sendProcessingComplete,
+      { userId: args.userId, fileId: args.fileId }
+    );
+    
+    return { processedUrl: processedFile.url };
+  },
+});
+```
+
+### **User Onboarding Workflow**
+
+```typescript
+export const userOnboardingWorkflow = workflow.define({
+  args: { userId: v.string(), email: v.string() },
+  handler: async (step, args): Promise => {
+    // Immediate welcome email
+    await step.runAction(
+      internal.emails.sendWelcome,
+      { userId: args.userId, email: args.email }
+    );
+    
+    // Set up user profile
+    await step.runMutation(
+      internal.users.createProfile,
+      { userId: args.userId }
+    );
+    
+    // Send tips email after 1 day
+    await step.runAction(
+      internal.emails.sendTips,
+      { userId: args.userId, email: args.email },
+      { runAfter: 24 * 60 * 60 * 1000 }
+    );
+    
+    // Check engagement after 3 days
+    const engagement = await step.runQuery(
+      internal.analytics.getUserEngagement,
+      { userId: args.userId },
+      { runAfter: 3 * 24 * 60 * 60 * 1000 }
+    );
+    
+    // Send re-engagement email if needed
+    if (engagement.score  => {
+    try {
+      // Critical step that must succeed
+      const result = await step.runAction(
+        internal.critical.process,
+        args,
+        { retry: { maxAttempts: 5, initialBackoffMs: 1000, base: 2 } }
+      );
+      
+      // Optional step - don't fail workflow if this fails
+      try {
+        await step.runAction(
+          internal.optional.enhance,
+          { data: result },
+          { retry: false }
+        );
+      } catch (error) {
+        console.log("Optional step failed, continuing:", error);
+      }
+      
+      return result;
+    } catch (error) {
+      // Log error and potentially send alert
+      await step.runAction(
+        internal.alerts.sendError,
+        { error: error.message, workflowId: "current" },
+        { retry: false }
+      );
+      throw error; // Re-throw to fail the workflow
+    }
+  },
+});
+```
+
+### **Debugging and Monitoring**
+
+- **Use descriptive step names** for better logging
+- **Add console.log statements** in your steps (not in workflow handlers)
+- **Monitor workflow status** regularly
+- **Set up alerts** for failed workflows
+
+### **Common Pitfalls to Avoid**
+
+1. **Don't modify workflow logic** while workflows are running - this can cause determinism violations
+2. **Don't forget to clean up** completed workflows
+3. **Don't use side effects** directly in workflow handlers
+4. **Don't create too many parallel workflows** - respect the maxParallelism limits
+
+## Troubleshooting
+
+### **Circular Dependencies**
+
+If you see circular dependency errors, add explicit return types:
+
+```typescript
+export const myWorkflow = workflow.define({
+  args: { data: v.string() },
+  handler: async (step, args): Promise => { // ← Add this return type
+    const result = await step.runAction(internal.process.data, args);
+    return result;
+  },
+});
+```
+
+### **Determinism Violations**
+
+If you change a workflow's structure while it's running, you'll get determinism errors. To fix this:
+
+1. Let existing workflows complete
+2. Deploy the new version
+3. Start new workflows with the updated logic
+
+### **Memory and Size Limits**
+
+Workflows have a 1MB limit for data passed between steps. If you hit this limit:
+
+1. Store large data in your database
+2. Pass only IDs between steps
+3. Retrieve data in each step as needed
+
+This guide covers everything you need to build reliable, long-running workflows with Convex. Start with simple workflows and gradually add more complex features as you become comfortable with the system.

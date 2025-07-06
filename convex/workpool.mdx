@@ -1,0 +1,647 @@
+# Comprehensive User Guide: Convex Workpool Component
+
+This guide will teach you how to manage background tasks and control parallelism in your Convex applications using the Workpool component. Think of workpools as traffic controllers for your background work - they ensure your important tasks don't get stuck behind less critical ones and prevent your system from being overwhelmed.
+
+## What is the Workpool Component?
+
+The Workpool component is a task management system that pools actions and mutations to control how many can run simultaneously. It's like having separate lanes on a highway - you can dedicate fast lanes for urgent traffic (like sending emails) and slower lanes for background work (like data scraping).
+
+**Key benefits**:
+- **Controlled parallelism**: Limit how many tasks run at once
+- **Smart retry logic**: Automatically retry failed tasks with backoff
+- **Task prioritization**: Separate important work from background tasks
+- **Completion callbacks**: Handle results whether tasks succeed, fail, or get canceled
+
+## Getting Started
+
+### **Installation**
+
+First, install the workpool component:
+
+```bash
+npm install @convex-dev/workpool
+```
+
+### **Configuration**
+
+Set up multiple workpools in your Convex configuration:
+
+```typescript
+// convex/convex.config.ts
+import { defineApp } from "convex/server";
+import workpool from "@convex-dev/workpool/convex.config";
+
+const app = defineApp();
+app.use(workpool, { name: "emailWorkpool" });
+app.use(workpool, { name: "scrapeWorkpool" });
+app.use(workpool, { name: "paymentWorkpool" });
+export default app;
+```
+
+### **Creating Workpools**
+
+Create workpool instances with different configurations:
+
+```typescript
+import { components } from "./_generated/api";
+import { Workpool } from "@convex-dev/workpool";
+
+// High-priority pool for user-facing tasks
+const emailPool = new Workpool(components.emailWorkpool, {
+  maxParallelism: 10,
+  retryActionsByDefault: true,
+  defaultRetryBehavior: {
+    maxAttempts: 3,
+    initialBackoffMs: 1000,
+    base: 2,
+  },
+});
+
+// Lower-priority pool for background work
+const scrapePool = new Workpool(components.scrapeWorkpool, {
+  maxParallelism: 3,
+  retryActionsByDefault: true,
+});
+
+// Serial pool for tasks that must run one at a time
+const paymentPool = new Workpool(components.paymentWorkpool, {
+  maxParallelism: 1,
+  retryActionsByDefault: false, // Payments need careful handling
+});
+```
+
+## Core Use Cases
+
+### **Separating and Prioritizing Workloads**
+
+The main problem workpools solve is task interference. Without workpools, all scheduled tasks compete for the same resources.
+
+```typescript
+// ❌ Problem: All tasks compete for resources
+export const userSignUp = mutation({
+  args: { email: v.string(), name: v.string() },
+  handler: async (ctx, args) => {
+    const userId = await ctx.db.insert("users", args);
+    
+    // This important email might be delayed by background scraping
+    await ctx.scheduler.runAfter(0, internal.auth.sendWelcomeEmail, { userId });
+  },
+});
+
+export const dailyDataSync = mutation({
+  handler: async (ctx) => {
+    // These 1000 scraping tasks might delay user emails
+    for (const url of allUrls) {
+      await ctx.scheduler.runAfter(0, internal.scraper.fetchData, { url });
+    }
+  },
+});
+```
+
+```typescript
+// ✅ Solution: Separate pools for different priorities
+export const userSignUp = mutation({
+  args: { email: v.string(), name: v.string() },
+  handler: async (ctx, args) => {
+    const userId = await ctx.db.insert("users", args);
+    
+    // High-priority email goes to dedicated pool
+    await emailPool.enqueueAction(ctx, internal.auth.sendWelcomeEmail, { userId });
+  },
+});
+
+export const dailyDataSync = mutation({
+  handler: async (ctx) => {
+    // Background work goes to separate pool with lower parallelism
+    for (const url of allUrls) {
+      await scrapePool.enqueueAction(ctx, internal.scraper.fetchData, { url });
+    }
+  },
+});
+```
+
+### **Reliable Task Processing with Retries**
+
+Workpools provide intelligent retry logic that prevents system overload during outages.
+
+```typescript
+const reliablePool = new Workpool(components.reliableWorkpool, {
+  maxParallelism: 5,
+  retryActionsByDefault: true,
+  defaultRetryBehavior: {
+    maxAttempts: 3,
+    initialBackoffMs: 1000,
+    base: 2, // Wait 1s, then 2s, then 4s
+  },
+});
+
+export const processPayment = mutation({
+  args: { userId: v.id("users"), amount: v.number() },
+  handler: async (ctx, args) => {
+    // This will retry automatically if the payment API is down
+    const workId = await reliablePool.enqueueAction(
+      ctx,
+      internal.payments.chargeCard,
+      args,
+      {
+        onComplete: internal.payments.handlePaymentResult,
+        context: { userId: args.userId, amount: args.amount },
+      }
+    );
+    
+    return workId;
+  },
+});
+```
+
+### **Preventing Database Conflicts**
+
+Use serial workpools (maxParallelism: 1) to prevent optimistic concurrency control (OCC) errors.
+
+```typescript
+const counterPool = new Workpool(components.counterWorkpool, {
+  maxParallelism: 1, // Only one at a time
+});
+
+export const incrementGlobalCounter = action({
+  handler: async (ctx) => {
+    // This mutation would conflict with itself if run in parallel
+    await counterPool.enqueueMutation(ctx, internal.counter.increment, {});
+  },
+});
+
+export const increment = internalMutation({
+  handler: async (ctx) => {
+    // This always reads and writes the same document
+    const countDoc = await ctx.db.query("counter").unique();
+    await ctx.db.patch(countDoc!._id, { count: countDoc!.count + 1 });
+  },
+});
+```
+
+## Working with Tasks
+
+### **Enqueueing Work**
+
+Add tasks to workpools using the enqueue methods:
+
+```typescript
+export const scheduleWork = mutation({
+  args: { userId: v.id("users") },
+  handler: async (ctx, { userId }) => {
+    // Enqueue a mutation
+    const mutationId = await emailPool.enqueueMutation(
+      ctx,
+      internal.emails.sendWelcome,
+      { userId }
+    );
+    
+    // Enqueue an action
+    const actionId = await scrapePool.enqueueAction(
+      ctx,
+      internal.scraper.fetchUserData,
+      { userId }
+    );
+    
+    // Enqueue with custom options
+    const delayedId = await emailPool.enqueueAction(
+      ctx,
+      internal.emails.sendFollowUp,
+      { userId },
+      {
+        runAfter: 24 * 60 * 60 * 1000, // 24 hours
+        retry: {
+          maxAttempts: 5,
+          initialBackoffMs: 500,
+          base: 1.5,
+        },
+        onComplete: internal.emails.handleEmailResult,
+        context: { emailType: 'followup', userId },
+      }
+    );
+    
+    return { mutationId, actionId, delayedId };
+  },
+});
+```
+
+### **Monitoring Task Status**
+
+Track the progress of your tasks:
+
+```typescript
+export const getTaskStatus = query({
+  args: { workId: vWorkIdValidator },
+  handler: async (ctx, { workId }) => {
+    return await emailPool.status(ctx, workId);
+  },
+});
+
+// Status can be:
+// { kind: "pending", previousAttempts: 0 } - Not started yet
+// { kind: "running", previousAttempts: 1 } - Currently executing
+// { kind: "finished" } - Completed (success, failure, or canceled)
+```
+
+### **Canceling Tasks**
+
+Stop tasks that are no longer needed:
+
+```typescript
+export const cancelTask = mutation({
+  args: { workId: vWorkIdValidator },
+  handler: async (ctx, { workId }) => {
+    await emailPool.cancel(ctx, workId);
+  },
+});
+
+export const cancelAllTasks = mutation({
+  handler: async (ctx) => {
+    await emailPool.cancelAll(ctx);
+  },
+});
+```
+
+## Advanced Features
+
+### **Completion Callbacks**
+
+Handle task results with onComplete callbacks:
+
+```typescript
+export const sendEmailWithTracking = mutation({
+  args: { userId: v.id("users"), emailType: v.string() },
+  handler: async (ctx, args) => {
+    await emailPool.enqueueAction(
+      ctx,
+      internal.emails.send,
+      args,
+      {
+        onComplete: internal.emails.logEmailResult,
+        context: { 
+          userId: args.userId, 
+          emailType: args.emailType,
+          sentAt: Date.now(),
+        },
+      }
+    );
+  },
+});
+
+export const logEmailResult = internalMutation({
+  args: {
+    workId: vWorkIdValidator,
+    result: vResultValidator,
+    context: v.object({
+      userId: v.id("users"),
+      emailType: v.string(),
+      sentAt: v.number(),
+    }),
+  },
+  handler: async (ctx, args) => {
+    const { result, context } = args;
+    
+    if (result.kind === "success") {
+      await ctx.db.insert("emailLog", {
+        userId: context.userId,
+        emailType: context.emailType,
+        status: "sent",
+        sentAt: context.sentAt,
+        deliveredAt: Date.now(),
+      });
+    } else if (result.kind === "failed") {
+      await ctx.db.insert("emailLog", {
+        userId: context.userId,
+        emailType: context.emailType,
+        status: "failed",
+        error: result.error,
+        sentAt: context.sentAt,
+      });
+      
+      // Maybe try a different email service
+      await backupEmailPool.enqueueAction(
+        ctx,
+        internal.emails.sendViaBackup,
+        { userId: context.userId, emailType: context.emailType }
+      );
+    }
+    // result.kind === "canceled" - task was canceled
+  },
+});
+```
+
+### **Custom Retry Strategies**
+
+Configure retry behavior per task or pool:
+
+```typescript
+// Pool-level defaults
+const smartPool = new Workpool(components.smartWorkpool, {
+  maxParallelism: 8,
+  retryActionsByDefault: true,
+  defaultRetryBehavior: {
+    maxAttempts: 3,
+    initialBackoffMs: 1000,
+    base: 2,
+  },
+});
+
+export const handleDifferentTasks = mutation({
+  handler: async (ctx) => {
+    // Use default retry behavior
+    await smartPool.enqueueAction(ctx, internal.api.reliableCall, {});
+    
+    // Custom retry for flaky API
+    await smartPool.enqueueAction(
+      ctx,
+      internal.api.flakyCall,
+      {},
+      {
+        retry: {
+          maxAttempts: 5,
+          initialBackoffMs: 500,
+          base: 1.5,
+        }
+      }
+    );
+    
+    // No retries for critical operations
+    await smartPool.enqueueAction(
+      ctx,
+      internal.payments.chargeCard,
+      {},
+      { retry: false }
+    );
+  },
+});
+```
+
+### **Idempotency Best Practices**
+
+Ensure your actions can be safely retried:
+
+```typescript
+// ❌ Non-idempotent: Could charge twice
+export const chargeCard = internalAction({
+  args: { userId: v.id("users"), amount: v.number() },
+  handler: async (ctx, { userId, amount }) => {
+    // If this succeeds but action fails later, retry will charge again
+    const charge = await paymentAPI.charge({ amount });
+    await ctx.runMutation(internal.payments.recordCharge, { userId, charge });
+  },
+});
+
+// ✅ Idempotent: Safe to retry
+export const chargeCardSafely = internalAction({
+  args: { 
+    userId: v.id("users"), 
+    amount: v.number(),
+    orderId: v.string(), // Unique identifier
+  },
+  handler: async (ctx, { userId, amount, orderId }) => {
+    // Payment API uses orderId to prevent duplicate charges
+    const charge = await paymentAPI.charge({ 
+      amount, 
+      idempotencyKey: orderId 
+    });
+    await ctx.runMutation(internal.payments.recordCharge, { 
+      userId, 
+      charge, 
+      orderId 
+    });
+  },
+});
+```
+
+## Real-World Examples
+
+### **E-commerce Order Processing**
+
+```typescript
+const orderPool = new Workpool(components.orderWorkpool, {
+  maxParallelism: 10,
+  retryActionsByDefault: true,
+});
+
+const emailPool = new Workpool(components.emailWorkpool, {
+  maxParallelism: 15,
+});
+
+const inventoryPool = new Workpool(components.inventoryWorkpool, {
+  maxParallelism: 1, // Prevent inventory conflicts
+});
+
+export const processOrder = mutation({
+  args: { 
+    userId: v.id("users"), 
+    items: v.array(v.object({ productId: v.id("products"), quantity: v.number() }))
+  },
+  handler: async (ctx, { userId, items }) => {
+    const orderId = await ctx.db.insert("orders", {
+      userId,
+      items,
+      status: "processing",
+      createdAt: Date.now(),
+    });
+    
+    // Process inventory updates serially to prevent conflicts
+    await inventoryPool.enqueueMutation(
+      ctx,
+      internal.inventory.reserveItems,
+      { orderId, items },
+      {
+        onComplete: internal.orders.handleInventoryResult,
+        context: { orderId, userId },
+      }
+    );
+    
+    // Send confirmation email in parallel
+    await emailPool.enqueueAction(
+      ctx,
+      internal.emails.sendOrderConfirmation,
+      { userId, orderId }
+    );
+    
+    return orderId;
+  },
+});
+
+export const handleInventoryResult = internalMutation({
+  args: {
+    workId: vWorkIdValidator,
+    result: vResultValidator,
+    context: v.object({ orderId: v.id("orders"), userId: v.id("users") }),
+  },
+  handler: async (ctx, { result, context }) => {
+    if (result.kind === "success") {
+      // Inventory reserved successfully, process payment
+      await orderPool.enqueueAction(
+        ctx,
+        internal.payments.processOrderPayment,
+        { orderId: context.orderId },
+        {
+          onComplete: internal.orders.handlePaymentResult,
+          context,
+        }
+      );
+    } else {
+      // Inventory reservation failed
+      await ctx.db.patch(context.orderId, { status: "failed" });
+      await emailPool.enqueueAction(
+        ctx,
+        internal.emails.sendOrderFailedEmail,
+        { userId: context.userId, reason: "insufficient_inventory" }
+      );
+    }
+  },
+});
+```
+
+### **Content Processing Pipeline**
+
+```typescript
+const uploadPool = new Workpool(components.uploadWorkpool, {
+  maxParallelism: 5,
+});
+
+const processingPool = new Workpool(components.processingWorkpool, {
+  maxParallelism: 3, // CPU-intensive work
+});
+
+export const handleFileUpload = mutation({
+  args: { 
+    userId: v.id("users"), 
+    fileId: v.id("_storage"),
+    fileName: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const uploadId = await ctx.db.insert("uploads", {
+      userId: args.userId,
+      fileId: args.fileId,
+      fileName: args.fileName,
+      status: "uploaded",
+    });
+    
+    // Start processing pipeline
+    await uploadPool.enqueueAction(
+      ctx,
+      internal.files.validateFile,
+      { uploadId, fileId: args.fileId },
+      {
+        onComplete: internal.files.handleValidation,
+        context: { uploadId, userId: args.userId },
+      }
+    );
+    
+    return uploadId;
+  },
+});
+
+export const handleValidation = internalMutation({
+  args: {
+    workId: vWorkIdValidator,
+    result: vResultValidator,
+    context: v.object({ uploadId: v.id("uploads"), userId: v.id("users") }),
+  },
+  handler: async (ctx, { result, context }) => {
+    if (result.kind === "success" && result.returnValue.valid) {
+      // File is valid, start processing
+      await processingPool.enqueueAction(
+        ctx,
+        internal.files.processFile,
+        { uploadId: context.uploadId },
+        {
+          onComplete: internal.files.handleProcessing,
+          context,
+          retry: {
+            maxAttempts: 2, // Processing is expensive, limit retries
+            initialBackoffMs: 5000,
+            base: 2,
+          },
+        }
+      );
+    } else {
+      // File validation failed
+      await ctx.db.patch(context.uploadId, { status: "invalid" });
+    }
+  },
+});
+```
+
+## Performance and Monitoring
+
+### **Optimizing Workpool Performance**
+
+**Choose appropriate parallelism levels**:
+- **High parallelism (10-20)**: For I/O-bound tasks like API calls
+- **Medium parallelism (3-8)**: For mixed workloads
+- **Low parallelism (1-2)**: For CPU-intensive or conflict-prone tasks
+
+**Batch related work**:
+```typescript
+// ❌ Inefficient: One task per item
+for (const item of items) {
+  await pool.enqueueAction(ctx, internal.process.singleItem, { item });
+}
+
+// ✅ Efficient: Batch processing
+const batches = chunk(items, 10);
+for (const batch of batches) {
+  await pool.enqueueAction(ctx, internal.process.batchItems, { batch });
+}
+```
+
+### **Monitoring with Axiom Queries**
+
+Track workpool health with these monitoring queries:
+
+**Check for backlogs**:
+```
+['your-dataset']
+| extend parsed_message = parse_json(trim("'", tostring(["data.message"])))
+| where parsed_message["component"] == "workpool" and parsed_message["event"] == "report"
+| summarize max_backlog = max(toint(parsed_message["backlog"]))
+  by bin(_time, 1m), workpool = tostring(["data.function.component_path"])
+```
+
+**Monitor failure rates**:
+```
+['your-dataset']
+| extend parsed_message = parse_json(trim("'", tostring(["data.message"])))
+| where parsed_message["component"] == "workpool" and parsed_message["event"] == "report"
+| summarize avg(todouble(parsed_message["permanentFailureRate"]))
+  by bin(_time, 5m), workpool = tostring(["data.function.component_path"])
+```
+
+## Best Practices and Tips
+
+### **Workpool Design Principles**
+
+1. **Separate by priority**: Create different pools for different importance levels
+2. **Match parallelism to workload**: I/O-bound tasks can handle higher parallelism
+3. **Make actions idempotent**: Ensure retry safety for all retryable actions
+4. **Use completion callbacks**: Handle results consistently across success/failure/cancellation
+5. **Monitor and alert**: Set up monitoring for backlogs and failure rates
+
+### **Common Pitfalls to Avoid**
+
+1. **Too many workpools**: Each pool has overhead - don't create too many
+2. **Ignoring idempotency**: Non-idempotent actions can cause data corruption when retried
+3. **Wrong parallelism settings**: Too high causes resource contention, too low causes delays
+4. **Missing error handling**: Always handle all result types in completion callbacks
+
+### **When to Use Workpools vs Direct Scheduling**
+
+**Use workpools when**:
+- You have high-volume background work
+- Tasks might fail and need retries
+- You need to prioritize different types of work
+- You want to prevent system overload
+
+**Use direct scheduling when**:
+- You have simple, one-off tasks
+- Tasks rarely fail
+- You need minimal latency
+- You're doing simple operations
+
+The Workpool component provides powerful tools for managing background tasks in Convex applications. By properly configuring workpools, implementing retry strategies, and monitoring performance, you can build robust systems that handle failures gracefully and maintain good performance under load.
